@@ -20,7 +20,8 @@
 # =============================================================================
 
 set -euo pipefail
-source "$(dirname "$0")/setup_env.sh"
+SCRIPT_DIR="/leonardo/home/userexternal/mciccone/exp/Megatron-LM/examples/diloco/slurm"
+source "${SCRIPT_DIR}/setup_env.sh"
 
 NUM_NODES="${SLURM_NNODES:-1}"
 NUM_GPUS_PER_NODE=4
