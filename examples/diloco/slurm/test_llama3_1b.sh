@@ -35,12 +35,12 @@ HIDDEN_SIZE=2048
 FFN_HIDDEN_SIZE=8192
 NUM_ATTN_HEADS=32
 NUM_QUERY_GROUPS=8
-SEQ_LEN=4096
+SEQ_LEN=1024
 MAX_POS_EMB=8192
 
 # Training
-MICRO_BATCH_SIZE=2
-GLOBAL_BATCH_SIZE=16
+MICRO_BATCH_SIZE=1
+GLOBAL_BATCH_SIZE=4
 TRAIN_ITERS=100
 LR=3e-4
 
@@ -62,6 +62,7 @@ torchrun \
     "${MEGATRON_ROOT}/pretrain_gpt.py" \
     \
     --use-mcore-models \
+    --transformer-impl transformer_engine \
     --num-layers          "${NUM_LAYERS}" \
     --hidden-size         "${HIDDEN_SIZE}" \
     --ffn-hidden-size     "${FFN_HIDDEN_SIZE}" \

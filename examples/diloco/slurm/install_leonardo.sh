@@ -11,9 +11,12 @@ set -euo pipefail
 VENV_PATH="/leonardo_scratch/fast/IscrB_Decentro/mciccone/envs/megatron"
 MEGATRON_ROOT="/leonardo/home/userexternal/mciccone/exp/Megatron-LM"
 TORCHFT_ROOT="/leonardo/home/userexternal/mciccone/exp/torchft"
+WHEELS_DIR="${MEGATRON_ROOT}/examples/diloco/wheels"
 
 # ---- 1. Modules -------------------------------------------------------------
-module load cuda/12.6 python/3.11.7
+# Note: no cuda module — PyTorch bundles its own CUDA runtime.
+# Loading cuda/12.6 causes NVML driver/library mismatch on nodes with older drivers.
+module load python/3.11.7
 
 # ---- 2. Create venv if needed -----------------------------------------------
 if [[ ! -f "${VENV_PATH}/bin/activate" ]]; then
@@ -22,8 +25,8 @@ if [[ ! -f "${VENV_PATH}/bin/activate" ]]; then
 fi
 source "${VENV_PATH}/bin/activate"
 
-# ---- 3. Upgrade pip ---------------------------------------------------------
-pip install --upgrade pip --quiet
+# ---- 3. Upgrade pip + build tools ------------------------------------------
+pip install --upgrade pip wheel setuptools --quiet
 
 # ---- 4. PyTorch (CUDA 12.6) -------------------------------------------------
 echo "Installing PyTorch..."
@@ -61,7 +64,37 @@ fi
 echo "Installing torchft..."
 pip install -e "${TORCHFT_ROOT}" --quiet
 
-# ---- 9. Build Megatron C++ helpers (optional) --------------------------------
+# ---- 9. Transformer Engine (needs GCC 12 + cuDNN + NCCL headers) ------------
+module load gcc/12.2.0 cudnn/8.9.7.29-12--gcc--12.2.0-cuda-12.2 nccl/2.22.3-1--gcc--12.2.0-cuda-12.2-spack0.22
+echo "Installing Transformer Engine (takes ~15-20 min, compiles CUDA kernels)..."
+pip install --no-build-isolation transformer_engine[pytorch]
+module purge
+
+# ---- 10. NVIDIA Apex (needs cuda/12.6 to match PyTorch cu126) ---------------
+# Uses a pre-built wheel if available (saves ~15 min recompile).
+# To rebuild: delete the wheel from WHEELS_DIR and re-run this script.
+mkdir -p "${WHEELS_DIR}"
+APEX_WHEEL=$(ls "${WHEELS_DIR}"/apex-*.whl 2>/dev/null | head -1)
+if [[ -n "${APEX_WHEEL}" ]]; then
+    echo "Installing NVIDIA Apex from cached wheel: ${APEX_WHEEL}"
+    pip install --no-build-isolation "${APEX_WHEEL}"
+else
+    module load cuda/12.6 gcc/12.2.0
+    echo "Building NVIDIA Apex from source (takes ~15 min)..."
+    pip install ninja
+    APEX_DIR="/tmp/apex_build"
+    if [[ ! -d "${APEX_DIR}" ]]; then
+        git clone https://github.com/NVIDIA/apex.git "${APEX_DIR}"
+    fi
+    cd "${APEX_DIR}" && git pull
+    APEX_CPP_EXT=1 APEX_CUDA_EXT=1 pip install --no-build-isolation .
+    # Save wheel for future installs
+    echo "Saving Apex wheel to ${WHEELS_DIR}..."
+    APEX_CPP_EXT=1 APEX_CUDA_EXT=1 pip wheel --no-build-isolation . -w "${WHEELS_DIR}"
+    module purge
+fi
+
+# ---- 11. Build Megatron C++ helpers (optional) --------------------------------
 echo "Building Megatron C++ dataset helpers..."
 cd "${MEGATRON_ROOT}"
 pip install pybind11 --quiet
@@ -71,4 +104,4 @@ pip install -e . --no-build-isolation --quiet || echo "C++ helpers build failed 
 echo ""
 echo "Installation complete. Verify with:"
 echo "  source ${VENV_PATH}/bin/activate"
-echo "  python -c 'import torch, megatron, torchft; print(torch.__version__)'"
+echo "  python -c 'import torch, megatron, torchft, transformer_engine, apex; print(torch.__version__)'"
