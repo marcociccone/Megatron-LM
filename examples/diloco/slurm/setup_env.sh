@@ -7,8 +7,7 @@
 # ---- Modules ---------------------------------------------------------------
 module purge
 module load cuda/12.6
-module load nccl/2.22.3-1--gcc--12.2.0-cuda-12.2
-module load openmpi/4.1.6--gcc--12.2.0-cuda-12.2
+module load python/3.11.7
 
 # ---- Python environment ----------------------------------------------------
 source /leonardo_scratch/fast/IscrB_Decentro/mciccone/envs/megatron/bin/activate
