@@ -2019,4 +2019,58 @@ def load_biencoder_checkpoint(model, only_query_model=False,
     if mpu.get_data_parallel_rank() == 0:
         print(' successfully loaded {}'.format(checkpoint_name))
 
+
+# -----------------------------------------------------------------------
+# DiLoCo checkpoint helpers
+# -----------------------------------------------------------------------
+
+_DILOCO_CKPT_FILENAME = "diloco_state.pt"
+
+
+def save_diloco_checkpoint(save_dir: str, iteration: int, diloco_trainer) -> None:
+    """Save DiLoCo outer optimizer + snapshot state alongside the Megatron checkpoint.
+
+    Only rank 0 of the local replica group writes the file.  The file is
+    placed inside the iteration sub-directory that Megatron already creates
+    (e.g. ``<save_dir>/iter_0001000/diloco_state.pt``).
+
+    Args:
+        save_dir: Megatron's ``--save`` directory.
+        iteration: Current training iteration.
+        diloco_trainer: A ``DiLoCoTrainer`` or ``FaultTolerantDiLoCoTrainer`` instance.
+    """
+    if torch.distributed.get_rank() != 0:
+        return
+
+    iteration_dir = os.path.join(save_dir, f"iter_{iteration:07d}")
+    os.makedirs(iteration_dir, exist_ok=True)
+    path = os.path.join(iteration_dir, _DILOCO_CKPT_FILENAME)
+
+    state = diloco_trainer.state_dict()
+    torch.save(state, path)
+    print(f"[DiLoCo] Saved outer optimizer state to {path}")
+
+
+def load_diloco_checkpoint(save_dir: str, iteration: int, diloco_trainer) -> bool:
+    """Load DiLoCo state from the iteration checkpoint directory.
+
+    Args:
+        save_dir: Megatron's ``--save`` / ``--load`` directory.
+        iteration: Iteration to load from.
+        diloco_trainer: DiLoCo trainer to restore state into.
+
+    Returns:
+        True if the state was loaded, False if the file was not found.
+    """
+    path = os.path.join(save_dir, f"iter_{iteration:07d}", _DILOCO_CKPT_FILENAME)
+    if not os.path.isfile(path):
+        print_rank_0(f"[DiLoCo] No outer optimizer checkpoint found at {path}, skipping.")
+        return False
+
+    map_location = torch.device("cpu")
+    state = torch.load(path, map_location=map_location, weights_only=False)
+    diloco_trainer.load_state_dict(state)
+    print_rank_0(f"[DiLoCo] Loaded outer optimizer state from {path}")
+    return True
+
     return model

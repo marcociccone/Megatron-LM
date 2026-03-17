@@ -78,6 +78,7 @@ def add_megatron_arguments(parser: argparse.ArgumentParser):
     parser = _add_one_logger_args(parser)
     parser = _add_inprocess_restart_args(parser)
     parser = _add_ft_package_args(parser)
+    parser = _add_diloco_args(parser)
     parser = _add_rerun_machine_args(parser)
     parser = _add_msc_args(parser)
     parser = _add_kitchen_quantization_arguments(parser)
@@ -2102,6 +2103,52 @@ def _add_one_logger_args(parser):
                        'part of. It will be used to track the changes in the '
                        'application side which might change the performance '
                        'baseline')
+    return parser
+
+
+def _add_diloco_args(parser):
+    group = parser.add_argument_group(title='diloco')
+    group.add_argument('--diloco', action='store_true',
+                       help='Enable DiLoCo (Distributed Low-Communication) training. '
+                       'Each Megatron instance is a separate replica group launched '
+                       'independently. Requires --diloco-lighthouse-addr.')
+    group.add_argument('--diloco-sync-every', type=int, default=500,
+                       help='Number of inner optimizer steps between DiLoCo outer syncs. '
+                       'Default: 500. Higher values = less communication, more divergence.')
+    group.add_argument('--diloco-outer-lr', type=float, default=0.7,
+                       help='Learning rate for DiLoCo outer optimizer (Nesterov SGD). '
+                       'Default: 0.7 (from DiLoCo paper).')
+    group.add_argument('--diloco-outer-momentum', type=float, default=0.9,
+                       help='Momentum for DiLoCo outer optimizer. Default: 0.9.')
+    group.add_argument('--diloco-outer-nesterov', action='store_true', default=True,
+                       help='Use Nesterov momentum in outer optimizer (default: True).')
+    group.add_argument('--diloco-outer-weight-decay', type=float, default=0.0,
+                       help='Weight decay for DiLoCo outer optimizer. Default: 0.0.')
+    group.add_argument('--diloco-backup-device', type=str, default='cpu',
+                       choices=['cpu', 'cuda'],
+                       help='Device for parameter snapshots. Default: cpu.')
+    group.add_argument('--diloco-pin-memory', action='store_true', default=True,
+                       help='Pin CPU memory for parameter snapshots (default: True).')
+    # torchft / fault tolerance args
+    group.add_argument('--diloco-lighthouse-addr', type=str, default='',
+                       help='Address of torchft Lighthouse server (e.g. localhost:29510). '
+                       'If set, enables fault-tolerant DiLoCo via torchft. '
+                       'If unset, uses basic DiLoCo (no fault tolerance).')
+    group.add_argument('--diloco-replica-id', type=str, default='',
+                       help='Unique identifier for this replica group (e.g. dc0, dc1). '
+                       'Used by the Lighthouse for tracking.')
+    group.add_argument('--diloco-min-replica-size', type=int, default=1,
+                       help='Minimum number of healthy replicas required for quorum. '
+                       'Default: 1 (training continues even with one replica).')
+    group.add_argument('--diloco-timeout-sec', type=float, default=60.0,
+                       help='Timeout in seconds for torchft collective operations. '
+                       'Default: 60.')
+    group.add_argument('--diloco-quorum-timeout-sec', type=float, default=300.0,
+                       help='Timeout in seconds for torchft quorum. Should be longer than '
+                       'sync_every * step_time. Default: 300.')
+    group.add_argument('--diloco-use-nccl', action='store_true',
+                       help='Use NCCL for cross-replica communication instead of Gloo. '
+                       'Requires GPU-to-GPU connectivity across replicas.')
     return parser
 
 

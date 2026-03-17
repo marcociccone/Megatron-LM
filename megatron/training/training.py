@@ -106,6 +106,7 @@ from megatron.training.checkpointing import load_checkpoint
 from megatron.training.checkpointing import save_checkpoint, save_grads
 from megatron.training.checkpointing import checkpoint_exists
 from megatron.training.checkpointing import get_loaded_iteration
+from megatron.training.checkpointing import save_diloco_checkpoint, load_diloco_checkpoint
 from megatron.core.full_cuda_graph import FullCudaGraphWrapper
 from megatron.core.transformer.cuda_graphs import TECudaGraphHelper
 from megatron.core.transformer.enums import CudaGraphScope
@@ -113,6 +114,7 @@ from megatron.core.transformer.module import Float16Module
 from megatron.core.distributed import DistributedDataParallelConfig, TorchFullyShardedDataParallelConfig
 from megatron.core.distributed import DistributedDataParallel as DDP
 from megatron.core.distributed.fsdp.mcore_fsdp_adapter import FullyShardedDataParallel as megatron_FSDP
+from megatron.core.distributed.diloco import DiLoCoConfig, create_diloco_trainer
 from megatron.core.optimizer.optimizer import param_group_identifier_keys
 
 from megatron.core.optimizer.qk_clip import clip_qk
@@ -2646,6 +2648,40 @@ def train(
             config.param_sync_func = config.param_sync_func[0]
     config.finalize_model_grads_func = finalize_model_grads
 
+    # Initialize DiLoCo trainer if enabled.
+    diloco_trainer = None
+    if getattr(args, 'diloco', False):
+        diloco_config = DiLoCoConfig(
+            enabled=True,
+            sync_every=args.diloco_sync_every,
+            outer_lr=args.diloco_outer_lr,
+            outer_momentum=args.diloco_outer_momentum,
+            outer_nesterov=args.diloco_outer_nesterov,
+            outer_weight_decay=args.diloco_outer_weight_decay,
+            backup_device=args.diloco_backup_device,
+            pin_memory=args.diloco_pin_memory,
+            lighthouse_addr=args.diloco_lighthouse_addr,
+            replica_id=args.diloco_replica_id,
+            min_replica_size=args.diloco_min_replica_size,
+            torchft_timeout_sec=args.diloco_timeout_sec,
+            torchft_quorum_timeout_sec=args.diloco_quorum_timeout_sec,
+            use_nccl=args.diloco_use_nccl,
+        )
+        diloco_trainer = create_diloco_trainer(
+            config=diloco_config,
+            model_chunks=model,
+            megatron_optimizer=optimizer,
+            opt_param_scheduler=opt_param_scheduler,
+        )
+        print_rank_0(
+            f'> DiLoCo enabled: sync_every={args.diloco_sync_every}, '
+            f'outer_lr={args.diloco_outer_lr}, '
+            f'fault_tolerant={bool(args.diloco_lighthouse_addr)}'
+        )
+        # Restore DiLoCo outer optimizer state if resuming from a checkpoint.
+        if args.load and args.iteration > 0:
+            load_diloco_checkpoint(args.load, args.iteration, diloco_trainer)
+
     if args.log_energy:
         energy_monitor.setup()
         energy_monitor.resume()
@@ -2892,6 +2928,11 @@ def train(
             forward_step_func, train_data_iterator, model, optimizer, opt_param_scheduler, config, forward_backward_func, iteration=iteration
         )
         ft_integration.on_training_step_end()
+
+        # DiLoCo outer synchronization (runs every sync_every inner steps).
+        if diloco_trainer is not None and not skipped_iter:
+            diloco_trainer.post_train_step(iteration)
+
         if should_checkpoint:
             save_checkpoint_and_time(
                 iteration,
@@ -2902,6 +2943,8 @@ def train(
                 checkpointing_context,
                 train_data_iterator=train_data_iterator,
             )
+            if diloco_trainer is not None and args.save:
+                save_diloco_checkpoint(args.save, iteration + 1, diloco_trainer)
         if should_exit:
             break
 
