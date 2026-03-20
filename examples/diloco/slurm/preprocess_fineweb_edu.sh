@@ -1,7 +1,7 @@
 #!/bin/bash
 #SBATCH --job-name=preprocess-fineweb-edu
 #SBATCH -A IscrB_Decentro
-#SBATCH --partition=lrd_all_serial
+#SBATCH --partition=boost_usr_prod
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=32
@@ -11,12 +11,12 @@
 #SBATCH --error=%x-%j.err
 
 # =============================================================================
-# Preprocess FineWeb-edu for Megatron-LM training.
+# Preprocess FineWeb-edu for Megatron-LM training using datatrove.
 #
-# Converts pre-downloaded parquet files → jsonl → Megatron .bin/.idx format
-# using the Llama 3 tokenizer.
+# Tokenizes pre-downloaded parquet files directly to Megatron .bin format
+# (no intermediate jsonl). Each task writes its own .bin file in parallel.
 #
-# Raw data already at:
+# Raw data:
 #   /leonardo_work/IscrB_Decentro/mciccone/sl3/datasets/fw-edu/sample/10BT
 #   /leonardo_work/IscrB_Decentro/mciccone/sl3/datasets/fw-edu/sample/100BT
 #
@@ -24,8 +24,7 @@
 #   sbatch examples/diloco/slurm/preprocess_fineweb_edu.sh
 #
 # Output:
-#   ${DATA_PATH}/fineweb_edu_10bt_text_document.bin
-#   ${DATA_PATH}/fineweb_edu_10bt_text_document.idx
+#   ${OUTPUT_PATH}/*.bin  (one per task, read by Megatron as a blend)
 # =============================================================================
 
 set -euo pipefail
@@ -37,60 +36,57 @@ source "${SCRIPT_DIR}/setup_env.sh"
 SPLIT="10BT"
 
 RAW_DATA_PATH="/leonardo_work/IscrB_Decentro/mciccone/sl3/datasets/fw-edu/sample/${SPLIT}"
-DATA_PATH="/leonardo_scratch/fast/IscrB_Decentro/mciccone/data"
-TOKENIZER_MODEL="meta-llama/Llama-3.2-1B"  # used only for tokenizer, not weights
-
 SPLIT_LOWER=$(echo "${SPLIT}" | tr '[:upper:]' '[:lower:]')
-JSONL_FILE="${DATA_PATH}/fineweb_edu_${SPLIT_LOWER}.jsonl"
-OUTPUT_PREFIX="${DATA_PATH}/fineweb_edu_${SPLIT_LOWER}"
 
-mkdir -p "${DATA_PATH}"
+# Set NUM_TASKS to the number of parquet files in the raw data folder
+NUM_TASKS=$(find "${RAW_DATA_PATH}" -name "*.parquet" | wc -l)
+echo "Found ${NUM_TASKS} parquet files in ${RAW_DATA_PATH}"
+OUTPUT_PATH="/leonardo_scratch/fast/IscrB_Decentro/mciccone/data/fineweb_edu_${SPLIT_LOWER}"
+TOKENIZER_MODEL="meta-llama/Llama-3.2-1B"
+LOG_PATH="/leonardo_scratch/fast/IscrB_Decentro/mciccone/logs/datatrove_fineweb_edu_${SPLIT_LOWER}"
 
-# ---- 1. Parquet → JSONL -----------------------------------------------------
-if [[ -f "${JSONL_FILE}" ]]; then
-    echo "=== Skipping parquet→jsonl (${JSONL_FILE} already exists) ==="
-else
-    echo "=== Converting parquet to jsonl (${SPLIT}) ==="
-    python3 - <<EOF
-import pandas as pd, glob, json, os
+mkdir -p "${OUTPUT_PATH}" "${LOG_PATH}"
 
-raw = "${RAW_DATA_PATH}"
-out = "${JSONL_FILE}"
+# ---- Install datatrove if needed --------------------------------------------
+python -c "import datatrove" 2>/dev/null || pip install datatrove --quiet
 
-files = sorted(glob.glob(f"{raw}/**/*.parquet", recursive=True))
-print(f"Found {len(files)} parquet files")
+# ---- Tokenize directly from parquet → Megatron .bin -------------------------
+echo "=== Tokenizing FineWeb-edu ${SPLIT} with datatrove (${NUM_TASKS} tasks) ==="
 
-with open(out, "w") as fout:
-    for i, f in enumerate(files):
-        df = pd.read_parquet(f, columns=["text"])
-        for text in df["text"]:
-            fout.write(json.dumps({"text": text}) + "\n")
-        if (i + 1) % 10 == 0:
-            print(f"  processed {i+1}/{len(files)} files")
+# Write to a real file — datatrove uses multiprocess which needs to re-import main
+TOKENIZE_SCRIPT="/tmp/tokenize_fineweb_${SPLIT_LOWER}.py"
+cat > "${TOKENIZE_SCRIPT}" <<EOF
+from datatrove.executor import LocalPipelineExecutor
+from datatrove.pipeline.readers import ParquetReader
+from datatrove.pipeline.tokens import MegatronDocumentTokenizer
 
-print(f"Done. Written to {out}")
+if __name__ == "__main__":
+    executor = LocalPipelineExecutor(
+        pipeline=[
+            ParquetReader(
+                "${RAW_DATA_PATH}",
+                text_key="text",
+                glob_pattern="**/*.parquet",
+            ),
+            MegatronDocumentTokenizer(
+                output_folder="${OUTPUT_PATH}",
+                tokenizer_name_or_path="${TOKENIZER_MODEL}",
+                eos_token=None,
+                save_filename="fineweb_edu_${SPLIT_LOWER}",
+            ),
+        ],
+        tasks=${NUM_TASKS},
+        logging_dir="${LOG_PATH}",
+    )
+    executor.run()
 EOF
-fi
 
-# ---- 2. Tokenize with Megatron ----------------------------------------------
-if [[ -f "${OUTPUT_PREFIX}_text_document.idx" ]]; then
-    echo "=== Skipping tokenization (${OUTPUT_PREFIX}_text_document.idx already exists) ==="
-else
-    echo "=== Tokenizing with Megatron (Llama 3.2 1B tokenizer) ==="
-    python "${MEGATRON_ROOT}/tools/preprocess_data.py" \
-    --input         "${JSONL_FILE}" \
-    --output-prefix "${OUTPUT_PREFIX}" \
-    --tokenizer-type HuggingFaceTokenizer \
-    --tokenizer-model "${TOKENIZER_MODEL}" \
-    --append-eod \
-    --workers        32 \
-    --chunk-size     1000
-fi
+python3 "${TOKENIZE_SCRIPT}"
 
 echo ""
 echo "=== Done ==="
 echo "Output files:"
-ls -lh "${DATA_PATH}"/fineweb_edu_${SPLIT_LOWER}*
+ls -lh "${OUTPUT_PATH}/"
 echo ""
-echo "Use in training with:"
-echo "  --data-path ${OUTPUT_PREFIX}_text_document"
+echo "Use in training with (blend of all task files):"
+echo "  Set DATA_DIR=${OUTPUT_PATH} in setup_env.sh (already the default)"

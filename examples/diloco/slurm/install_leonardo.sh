@@ -27,6 +27,8 @@ source "${VENV_PATH}/bin/activate"
 
 # ---- 3. Upgrade pip + build tools ------------------------------------------
 pip install --upgrade pip wheel setuptools --quiet
+# SOCKS proxy support (needed on compute nodes) + datatrove for data preprocessing
+pip install "requests[socks]" "httpx[socks]" datatrove pyarrow --quiet
 
 # ---- 4. PyTorch (CUDA 12.6) -------------------------------------------------
 echo "Installing PyTorch..."

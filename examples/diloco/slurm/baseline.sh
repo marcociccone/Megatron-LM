@@ -7,7 +7,7 @@
 #SBATCH --gres=gpu:4
 #SBATCH --cpus-per-task=32
 #SBATCH --mem=128GB
-#SBATCH --time=48:00:00
+#SBATCH --time=1:00:00
 #SBATCH --output=%x-%j.out
 #SBATCH --error=%x-%j.err
 
@@ -26,35 +26,47 @@ NODE_RANK="${SLURM_NODEID:-0}"
 MASTER_ADDR="$(scontrol show hostnames "${SLURM_JOB_NODELIST}" | head -n 1)"
 MASTER_PORT="${MASTER_PORT:-29500}"
 
-MODEL_SIZE="${MODEL_SIZE:-small}"
-case "${MODEL_SIZE}" in
-  small)   NUM_LAYERS=12; HIDDEN_SIZE=768;  NUM_ATTN_HEADS=12 ;;
-  medium)  NUM_LAYERS=24; HIDDEN_SIZE=1024; NUM_ATTN_HEADS=16 ;;
-  large)   NUM_LAYERS=24; HIDDEN_SIZE=2048; NUM_ATTN_HEADS=16 ;;
-  xl)      NUM_LAYERS=32; HIDDEN_SIZE=4096; NUM_ATTN_HEADS=32 ;;
-esac
+# ---- Model config (Llama 3 1B) ----------------------------------------------
+NUM_LAYERS=16
+HIDDEN_SIZE=2048
+FFN_HIDDEN_SIZE=8192
+NUM_ATTN_HEADS=32
+NUM_QUERY_GROUPS=8
+SEQ_LEN=4096
+MAX_POS_EMB=8192
 
 TP_SIZE="${TP_SIZE:-1}"
 PP_SIZE="${PP_SIZE:-1}"
 
 MICRO_BATCH_SIZE="${MICRO_BATCH_SIZE:-4}"
-GLOBAL_BATCH_SIZE="${GLOBAL_BATCH_SIZE:-512}"
-SEQ_LEN="${SEQ_LEN:-2048}"
+GLOBAL_BATCH_SIZE="${GLOBAL_BATCH_SIZE:-64}"
 TRAIN_ITERS="${TRAIN_ITERS:-100000}"
 LR="${LR:-3e-4}"
 
 # ---- W&B config ------------------------------------------------------------
 WANDB_PROJECT="${WANDB_PROJECT:-megatron-diloco}"
-WANDB_ENTITY="${WANDB_ENTITY:-}"   # <EDIT: your team/org, or leave empty>
-WANDB_RUN_NAME="${WANDB_RUN_NAME:-baseline_${MODEL_SIZE}}"
+WANDB_ENTITY="${WANDB_ENTITY:-mciccone}"
+WANDB_RUN_NAME="${WANDB_RUN_NAME:-baseline_llama3_1b}"
 
+# ---- Paths -----------------------------------------------------------------
 CHECKPOINT_PATH="${BASE_CHECKPOINT_PATH}/baseline"
 RUN_LOG_PATH="${LOG_PATH}/baseline"
 mkdir -p "${CHECKPOINT_PATH}" "${RUN_LOG_PATH}"
 
+# ---- Data blend (same as replica.sh) ----------------------------------------
+DATA_BLEND=()
+for f in "${DATA_DIR}"/fineweb_edu_10bt_*.bin; do
+    DATA_BLEND+=("1" "${f%.bin}")
+done
+if [[ ${#DATA_BLEND[@]} -eq 0 ]]; then
+    echo "ERROR: No .bin files found in ${DATA_DIR}. Run preprocess_fineweb_edu.sh first."
+    exit 1
+fi
+
 echo "================================================"
 echo "Baseline run (no DiLoCo)"
-echo "  Model: ${MODEL_SIZE}  TP=${TP_SIZE} PP=${PP_SIZE}"
+echo "  Model: Llama 3 1B  TP=${TP_SIZE} PP=${PP_SIZE}"
+echo "  GBS=${GLOBAL_BATCH_SIZE}  Data files: $(( ${#DATA_BLEND[@]} / 2 )) shards"
 echo "================================================"
 
 torchrun \
@@ -65,32 +77,45 @@ torchrun \
     --master_port="${MASTER_PORT}" \
     "${MEGATRON_ROOT}/pretrain_gpt.py" \
     \
+    --use-mcore-models \
+    --transformer-impl transformer_engine \
     --num-layers          "${NUM_LAYERS}" \
     --hidden-size         "${HIDDEN_SIZE}" \
+    --ffn-hidden-size     "${FFN_HIDDEN_SIZE}" \
     --num-attention-heads "${NUM_ATTN_HEADS}" \
+    --group-query-attention \
+    --num-query-groups    "${NUM_QUERY_GROUPS}" \
     --seq-length          "${SEQ_LEN}" \
-    --max-position-embeddings "${SEQ_LEN}" \
-    --tokenizer-type      GPT2BPETokenizer \
-    --vocab-file          "${VOCAB_FILE}" \
-    --merge-file          "${MERGE_FILE}" \
+    --max-position-embeddings "${MAX_POS_EMB}" \
+    --position-embedding-type rope \
+    --rotary-base         500000 \
+    --rotary-percent      1.0 \
+    --normalization       RMSNorm \
+    --swiglu \
+    --disable-bias-linear \
+    --untie-embeddings-and-output-weights \
+    --no-position-embedding \
+    --attention-dropout   0.0 \
+    --hidden-dropout      0.0 \
     \
-    --micro-batch-size  "${MICRO_BATCH_SIZE}" \
-    --global-batch-size "${GLOBAL_BATCH_SIZE}" \
-    --train-iters       "${TRAIN_ITERS}" \
-    --lr                "${LR}" \
-    --min-lr            1e-5 \
-    --lr-decay-style    cosine \
-    --lr-warmup-iters   2000 \
-    --weight-decay      0.1 \
-    --clip-grad         1.0 \
+    --tokenizer-type      HuggingFaceTokenizer \
+    --tokenizer-model     "meta-llama/Llama-3.2-1B" \
+    \
+    --micro-batch-size    "${MICRO_BATCH_SIZE}" \
+    --global-batch-size   "${GLOBAL_BATCH_SIZE}" \
+    --train-iters         "${TRAIN_ITERS}" \
+    --lr                  "${LR}" \
+    --min-lr              1e-5 \
+    --lr-decay-style      cosine \
+    --lr-warmup-iters     2000 \
+    --weight-decay        0.1 \
+    --clip-grad           1.0 \
     --bf16 \
-    --attention-dropout 0.0 \
-    --hidden-dropout    0.0 \
     \
     --tensor-model-parallel-size   "${TP_SIZE}" \
     --pipeline-model-parallel-size "${PP_SIZE}" \
     \
-    --data-path "${DATA_PATH}" \
+    --data-path "${DATA_BLEND[@]}" \
     --split     949,50,1 \
     \
     --save          "${CHECKPOINT_PATH}" \
@@ -99,9 +124,11 @@ torchrun \
     --use-dist-ckpt \
     --ckpt-format   torch_dist \
     \
-    --log-interval  10 \
+    --log-throughput \
+    --log-interval  1 \
     --eval-interval 1000 \
     --eval-iters    10 \
+    --tensorboard-dir "${RUN_LOG_PATH}/tensorboard" \
     --wandb-project  "${WANDB_PROJECT}" \
     --wandb-exp-name "${WANDB_RUN_NAME}" \
     ${WANDB_ENTITY:+--wandb-entity "${WANDB_ENTITY}"} \

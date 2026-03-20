@@ -46,7 +46,7 @@ class _BaseDataParallel(MegatronModule):
         """Scale all gradients inside the buffers by `scaling_factor`."""
         pass
 
-    def finish_grad_sync(self):
+    def finish_grad_sync(self, force_all_reduce: bool = False):
         """
         Finishes grad sync (all-reduce or reduce-scatter) communication operations
         for all model gradients.

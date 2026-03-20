@@ -1,25 +1,27 @@
 #!/bin/bash
-#SBATCH --job-name=megatron-diloco
+#SBATCH --job-name=megatron-diloco-small
 #SBATCH -A IscrB_Decentro
 #SBATCH --partition=boost_usr_prod
-#SBATCH --nodes=2
+#SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
-#SBATCH --gres=gpu:4
-#SBATCH --cpus-per-task=32
-#SBATCH --mem=128GB
+#SBATCH --gres=gpu:1
+#SBATCH --cpus-per-task=8
+#SBATCH --mem=16GB
 #SBATCH --time=01:00:00
-#SBATCH --output=%x-%j.out
-#SBATCH --error=%x-%j.err
+#SBATCH --output=%x-%j-replica${REPLICA_ID}.out
+#SBATCH --error=%x-%j-replica${REPLICA_ID}.err
 
 # =============================================================================
-# Megatron DiLoCo replica — one job per datacenter/partition.
+# Megatron DiLoCo replica — small model (~100M params) for correctness testing.
+#
+# Use this BEFORE the full 1.5B run to verify that:
+#   - DiLoCo sync commits at steps 10, 20, …
+#   - Fault-tolerance path works (kill one replica mid-run)
+#   - No CUDA OOM (100M model: <3 GB/GPU for params + optimizer states)
 #
 # Submit as:
-#   REPLICA_ID=0 LIGHTHOUSE_ADDR=<host>:29510 sbatch replica.sh
-#   REPLICA_ID=1 LIGHTHOUSE_ADDR=<host>:29510 sbatch replica.sh
-#
-# Or with auto-discovery (if lighthouse.sh wrote the address file):
-#   REPLICA_ID=0 sbatch replica.sh
+#   REPLICA_ID=0 LIGHTHOUSE_ADDR=<host>:29510 sbatch replica_small.sh
+#   REPLICA_ID=1 LIGHTHOUSE_ADDR=<host>:29510 sbatch replica_small.sh
 # =============================================================================
 
 set -euo pipefail
@@ -44,28 +46,25 @@ fi
 
 # ---- Cluster topology -------------------------------------------------------
 NUM_NODES="${SLURM_NNODES:-1}"
-NUM_GPUS_PER_NODE=4
-# Use different rdzv port per replica to avoid collisions on shared clusters
-RDZV_PORT=$(( 29500 + REPLICA_ID ))
-# Resolve head node IP address (hostname may not be routable; IP always is)
-head_node=$(scontrol show hostnames "${SLURM_JOB_NODELIST}" | head -n 1)
-head_node_ip=$(srun --nodes=1 --ntasks=1 -w "${head_node}" hostname --ip-address)
+NUM_GPUS_PER_NODE=1
+NODE_RANK="${SLURM_NODEID:-0}"
+MASTER_ADDR="$(scontrol show hostnames "${SLURM_JOB_NODELIST}" | head -n 1)"
+MASTER_PORT=$(( 29500 + REPLICA_ID ))
 
-# ---- Replicas & GBS (virtual DP pool) ---------------------------------------
-# Each replica uses local_GBS = total_GBS / N_replicas. Together they cover
-# the same total tokens per step as a single run with N_replicas*4 GPUs.
+# ---- Replicas & GBS ---------------------------------------------------------
 N_REPLICAS="${N_REPLICAS:-2}"
-TOTAL_GLOBAL_BATCH_SIZE="${TOTAL_GLOBAL_BATCH_SIZE:-64}"
+TOTAL_GLOBAL_BATCH_SIZE="${TOTAL_GLOBAL_BATCH_SIZE:-32}"
 GLOBAL_BATCH_SIZE=$(( TOTAL_GLOBAL_BATCH_SIZE / N_REPLICAS ))
 
-# ---- Model config (Llama 3 1B) ----------------------------------------------
-NUM_LAYERS=16
-HIDDEN_SIZE=2048
-FFN_HIDDEN_SIZE=8192
-NUM_ATTN_HEADS=32
+# ---- Model config (~100M params) --------------------------------------------
+# 8 layers, hidden=1024, ffn=4096 → ~100M parameters
+NUM_LAYERS=8
+HIDDEN_SIZE=1024
+FFN_HIDDEN_SIZE=4096
+NUM_ATTN_HEADS=16
 NUM_QUERY_GROUPS=8
-SEQ_LEN=4096
-MAX_POS_EMB=8192
+SEQ_LEN=2048
+MAX_POS_EMB=4096
 
 # ---- Parallelism ------------------------------------------------------------
 TP_SIZE="${TP_SIZE:-1}"
@@ -74,30 +73,31 @@ DP_SIZE=$(( NUM_NODES * NUM_GPUS_PER_NODE / TP_SIZE / PP_SIZE ))
 
 # ---- Training hyperparams --------------------------------------------------
 MICRO_BATCH_SIZE="${MICRO_BATCH_SIZE:-4}"
-TRAIN_ITERS="${TRAIN_ITERS:-100000}"
+TRAIN_ITERS="${TRAIN_ITERS:-100}"
 LR="${LR:-3e-4}"
 
 # ---- DiLoCo hyperparams ----------------------------------------------------
-DILOCO_SYNC_EVERY="${DILOCO_SYNC_EVERY:-30}"
+# Sync every 10 steps for fast first-sync validation
+DILOCO_SYNC_EVERY="${DILOCO_SYNC_EVERY:-10}"
 DILOCO_OUTER_LR="${DILOCO_OUTER_LR:-0.7}"
 DILOCO_OUTER_MOMENTUM="${DILOCO_OUTER_MOMENTUM:-0.9}"
 DILOCO_MIN_REPLICAS="${DILOCO_MIN_REPLICAS:-2}"
-DILOCO_QUORUM_TIMEOUT="${DILOCO_QUORUM_TIMEOUT:-600}"
-DILOCO_TIMEOUT="${DILOCO_TIMEOUT:-600}"
+DILOCO_QUORUM_TIMEOUT="${DILOCO_QUORUM_TIMEOUT:-300}"
+DILOCO_TIMEOUT="${DILOCO_TIMEOUT:-300}"
 
 # ---- W&B config ------------------------------------------------------------
-WANDB_PROJECT="${WANDB_PROJECT:-megatron-diloco}"
+WANDB_PROJECT="${WANDB_PROJECT:-megatron-diloco-small}"
 WANDB_ENTITY="${WANDB_ENTITY:-mciccone}"
-WANDB_RUN_NAME="${WANDB_RUN_NAME:-diloco_llama3_1b_replica_${REPLICA_ID}}"  # overridden by launch_replicas.sh
+WANDB_RUN_NAME="${WANDB_RUN_NAME:-diloco_small_replica_${REPLICA_ID}}"
 
 # ---- Paths -----------------------------------------------------------------
 # Checkpoints are shared across runs (resume from latest).
 # Logs are per-job to avoid overwriting previous runs.
-CHECKPOINT_PATH="${CHECKPOINT_OVERRIDE:-${BASE_CHECKPOINT_PATH}/diloco_replica_${REPLICA_ID}}"
-RUN_LOG_PATH="${LOG_PATH}/diloco_replica_${REPLICA_ID}/${SLURM_JOB_ID}"
+CHECKPOINT_PATH="${BASE_CHECKPOINT_PATH}/diloco_small_replica_${REPLICA_ID}"
+RUN_LOG_PATH="${LOG_PATH}/diloco_small_replica_${REPLICA_ID}/${SLURM_JOB_ID}"
 mkdir -p "${CHECKPOINT_PATH}" "${RUN_LOG_PATH}"
 
-# ---- Data blend (one entry per per-task .bin file from preprocessing) -------
+# ---- Data blend -------------------------------------------------------------
 DATA_BLEND=()
 for f in "${DATA_DIR}"/fineweb_edu_10bt_*.bin; do
     DATA_BLEND+=("1" "${f%.bin}")
@@ -108,25 +108,23 @@ if [[ ${#DATA_BLEND[@]} -eq 0 ]]; then
 fi
 
 echo "================================================"
-echo "DiLoCo Replica ${REPLICA_ID} / ${N_REPLICAS}"
+echo "DiLoCo Small Replica ${REPLICA_ID} / ${N_REPLICAS}"
 echo "  Lighthouse:  ${LIGHTHOUSE_ADDR}"
-echo "  Head node:   ${head_node} (${head_node_ip}:${RDZV_PORT})"
+echo "  Master:      ${MASTER_ADDR}:${MASTER_PORT}"
 echo "  Nodes:       ${NUM_NODES} x ${NUM_GPUS_PER_NODE} GPUs"
-echo "  Model:       Llama 3 1B (${NUM_LAYERS}L ${HIDDEN_SIZE}H)"
+echo "  Model:       ~100M (${NUM_LAYERS}L ${HIDDEN_SIZE}H)"
 echo "  TP=${TP_SIZE} PP=${PP_SIZE} DP=${DP_SIZE}"
 echo "  local_GBS:   ${GLOBAL_BATCH_SIZE}  (total_GBS=${TOTAL_GLOBAL_BATCH_SIZE})"
 echo "  sync_every:  ${DILOCO_SYNC_EVERY}"
-echo "  Data files:  $(( ${#DATA_BLEND[@]} / 2 )) .bin shards in ${DATA_DIR}"
-echo "  Checkpoint:  ${CHECKPOINT_PATH}"
+echo "  backup_device: cuda (GPU snapshots — safe at 100M scale)"
 echo "================================================"
 
-srun --kill-on-bad-exit=1 \
-  torchrun \
+torchrun \
     --nproc_per_node="${NUM_GPUS_PER_NODE}" \
     --nnodes="${NUM_NODES}" \
-    --rdzv_id="${SLURM_JOB_ID}" \
-    --rdzv_backend=c10d \
-    --rdzv_endpoint="${head_node_ip}:${RDZV_PORT}" \
+    --node_rank="${NODE_RANK}" \
+    --master_addr="${MASTER_ADDR}" \
+    --master_port="${MASTER_PORT}" \
     --max_restarts=3 \
     "${MEGATRON_ROOT}/pretrain_gpt.py" \
     \
@@ -160,7 +158,7 @@ srun --kill-on-bad-exit=1 \
     --lr                  "${LR}" \
     --min-lr              1e-5 \
     --lr-decay-style      cosine \
-    --lr-warmup-iters     2000 \
+    --lr-warmup-iters     20 \
     --weight-decay        0.1 \
     --clip-grad           1.0 \
     --bf16 \
@@ -173,22 +171,19 @@ srun --kill-on-bad-exit=1 \
     \
     --save          "${CHECKPOINT_PATH}" \
     --load          "${CHECKPOINT_PATH}" \
-    --save-interval 1000 \
+    --save-interval 500 \
     --use-dist-ckpt \
     --ckpt-format   torch_dist \
     \
     --log-throughput \
-    --log-interval  10 \
-    --eval-interval 1000 \
-    --eval-iters    10 \
+    --log-interval  5 \
+    --eval-interval 500 \
+    --eval-iters    5 \
     --tensorboard-dir "${RUN_LOG_PATH}/tensorboard" \
     --wandb-project  "${WANDB_PROJECT}" \
     --wandb-exp-name "${WANDB_RUN_NAME}" \
     ${WANDB_ENTITY:+--wandb-entity "${WANDB_ENTITY}"} \
     --wandb-save-dir "${RUN_LOG_PATH}/wandb" \
-    \
-    --use-torch-fsdp2 \
-    --no-gradient-accumulation-fusion \
     \
     --diloco \
     --diloco-sync-every          "${DILOCO_SYNC_EVERY}" \

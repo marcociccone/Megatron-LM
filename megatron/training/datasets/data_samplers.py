@@ -11,6 +11,7 @@ from torch.utils.data import Dataset
 
 from megatron.core import mpu
 from megatron.core.datasets.utils import Split
+from megatron.core.distributed.diloco import get_diloco_dp_info
 
 from megatron.training import get_args
 from megatron.training.dist_signal_handler import DistributedSignalHandler
@@ -30,13 +31,20 @@ def build_pretraining_data_loader(dataset, consumed_samples):
     else:
         split = None
 
+    # Virtual DP pool for DiLoCo: treat N replicas as a single pool of
+    # (N_replicas * local_dp) ranks sharing one document shuffle.
+    local_dp_rank = mpu.get_data_parallel_rank()
+    local_dp_size = mpu.get_data_parallel_world_size()
+    effective_dp_size, effective_dp_rank = get_diloco_dp_info(local_dp_rank, local_dp_size)
+
     if split == Split.valid and args.full_validation:
+        # Validation is identical across all replicas — use local DP only.
         batch_sampler = MegatronPretrainingSampler(
             total_samples=len(dataset),
             consumed_samples=0,
             micro_batch_size=args.micro_batch_size,
-            data_parallel_rank=mpu.get_data_parallel_rank(),
-            data_parallel_size=mpu.get_data_parallel_world_size(),
+            data_parallel_rank=local_dp_rank,
+            data_parallel_size=local_dp_size,
         )
     elif args.dataloader_type == 'single':
         if args.hybrid_context_parallel:
@@ -48,13 +56,13 @@ def build_pretraining_data_loader(dataset, consumed_samples):
                 data_parallel_rank=mpu.get_data_parallel_rank(),
                 data_parallel_size=mpu.get_data_parallel_world_size())
         else:
-            # Megatron sampler
+            # Megatron sampler — use virtual DP rank/size for DiLoCo pool.
             batch_sampler = MegatronPretrainingSampler(
                 total_samples=len(dataset),
                 consumed_samples=consumed_samples,
                 micro_batch_size=args.micro_batch_size,
-                data_parallel_rank=mpu.get_data_parallel_rank(),
-                data_parallel_size=mpu.get_data_parallel_world_size())
+                data_parallel_rank=effective_dp_rank,
+                data_parallel_size=effective_dp_size)
     elif args.dataloader_type == 'cyclic':
         batch_sampler = MegatronPretrainingRandomSampler(
             dataset,

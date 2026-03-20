@@ -1944,68 +1944,81 @@ def training_log(
 
     # learning rate will be None on ranks without trainable params, so we must gather across mp ranks
     learning_rate: float | None = reduce_max_stat_across_model_parallel_group(learning_rate)
-    # Tensorboard values.
-    if writer and (iteration % args.tensorboard_log_interval == 0):
+    # Tensorboard / W&B values.
+    # Note: W&B logging is decoupled from the TensorBoard writer so that metrics are
+    # always logged even when --tensorboard-dir is not set or tensorboard is unavailable.
+    if (writer or wandb_writer) and (iteration % args.tensorboard_log_interval == 0):
         if wandb_writer:
             wandb_writer.log({'samples vs steps': args.consumed_train_samples}, iteration)
         if learning_rate is not None:
-            writer.add_scalar('learning-rate', learning_rate, iteration)
-            writer.add_scalar('learning-rate vs samples', learning_rate, args.consumed_train_samples)
+            if writer:
+                writer.add_scalar('learning-rate', learning_rate, iteration)
+                writer.add_scalar('learning-rate vs samples', learning_rate, args.consumed_train_samples)
             if wandb_writer:
                 wandb_writer.log({'learning-rate': learning_rate}, iteration)
         if args.skipped_train_samples > 0:
-            writer.add_scalar('skipped-train-samples', args.skipped_train_samples, iteration)
+            if writer:
+                writer.add_scalar('skipped-train-samples', args.skipped_train_samples, iteration)
             if wandb_writer:
                 wandb_writer.log({'skipped-train-samples': args.skipped_train_samples}, iteration)
-        writer.add_scalar('batch-size', batch_size, iteration)
-        writer.add_scalar('batch-size vs samples', batch_size, args.consumed_train_samples)
+        if writer:
+            writer.add_scalar('batch-size', batch_size, iteration)
+            writer.add_scalar('batch-size vs samples', batch_size, args.consumed_train_samples)
         if wandb_writer:
             wandb_writer.log({'batch-size': batch_size}, iteration)
         # Log bins for packed mode
         if has_rl_utils and args.rl_use_sequence_packing:
             packing_metrics = rl_utils.get_sequence_packing_tensorboard_metrics(args)
-            for metric_name, metric_value in packing_metrics.items():
-                writer.add_scalar(metric_name, metric_value, iteration)
+            if writer:
+                for metric_name, metric_value in packing_metrics.items():
+                    writer.add_scalar(metric_name, metric_value, iteration)
             if wandb_writer and packing_metrics:
                 wandb_writer.log(packing_metrics, iteration)
         for key in loss_dict:
-            writer.add_scalar(key, loss_dict[key], iteration)
-            writer.add_scalar(key + ' vs samples', loss_dict[key], args.consumed_train_samples)
+            if writer:
+                writer.add_scalar(key, loss_dict[key], iteration)
+                writer.add_scalar(key + ' vs samples', loss_dict[key], args.consumed_train_samples)
             if wandb_writer:
                 wandb_writer.log({key: loss_dict[key]}, iteration)
         if args.log_loss_scale_to_tensorboard:
-            writer.add_scalar('loss-scale', loss_scale, iteration)
-            writer.add_scalar('loss-scale vs samples', loss_scale, args.consumed_train_samples)
+            if writer:
+                writer.add_scalar('loss-scale', loss_scale, iteration)
+                writer.add_scalar('loss-scale vs samples', loss_scale, args.consumed_train_samples)
             if wandb_writer:
                 wandb_writer.log({'loss-scale': loss_scale}, iteration)
         if args.log_world_size_to_tensorboard:
-            writer.add_scalar('world-size', args.world_size, iteration)
-            writer.add_scalar('world-size vs samples', args.world_size, args.consumed_train_samples)
+            if writer:
+                writer.add_scalar('world-size', args.world_size, iteration)
+                writer.add_scalar('world-size vs samples', args.world_size, args.consumed_train_samples)
             if wandb_writer:
                 wandb_writer.log({'world-size': args.world_size}, iteration)
         if grad_norm is not None:
-            writer.add_scalar('grad-norm', grad_norm, iteration)
-            writer.add_scalar('grad-norm vs samples', grad_norm, args.consumed_train_samples)
+            if writer:
+                writer.add_scalar('grad-norm', grad_norm, iteration)
+                writer.add_scalar('grad-norm vs samples', grad_norm, args.consumed_train_samples)
             if wandb_writer:
                 wandb_writer.log({'grad-norm': grad_norm}, iteration)
         if num_zeros_in_grad is not None:
-            writer.add_scalar('num-zeros', num_zeros_in_grad, iteration)
-            writer.add_scalar(
-                'num-zeros vs samples', num_zeros_in_grad, args.consumed_train_samples
-            )
+            if writer:
+                writer.add_scalar('num-zeros', num_zeros_in_grad, iteration)
+                writer.add_scalar(
+                    'num-zeros vs samples', num_zeros_in_grad, args.consumed_train_samples
+                )
             if wandb_writer:
                 wandb_writer.log({'num-zeros': num_zeros_in_grad}, iteration)
         if params_norm is not None:
-            writer.add_scalar('params-norm', params_norm, iteration)
-            writer.add_scalar('params-norm vs samples', params_norm, args.consumed_train_samples)
+            if writer:
+                writer.add_scalar('params-norm', params_norm, iteration)
+                writer.add_scalar('params-norm vs samples', params_norm, args.consumed_train_samples)
             if wandb_writer:
                 wandb_writer.log({'params-norm': params_norm}, iteration)
         if getattr(args, 'perform_rl_step', False):
             grpo_collection_iteration = iteration // (args.grpo_iterations * ( ( args.grpo_samples_per_iteration )// args.global_batch_size ))
-            writer.add_scalar('grpo_collection_iteration', grpo_collection_iteration, iteration)
+            if writer:
+                writer.add_scalar('grpo_collection_iteration', grpo_collection_iteration, iteration)
             if wandb_writer:
                 wandb_writer.log({'grpo_collection_iteration': grpo_collection_iteration}, iteration)
-        if args.log_memory_to_tensorboard:
+        if args.log_memory_to_tensorboard and writer:
             mem_stats = torch.cuda.memory_stats()
             writer.add_scalar(
                 "mem-reserved-bytes", mem_stats["reserved_bytes.all.current"], iteration
@@ -2018,7 +2031,8 @@ def training_log(
             )
             writer.add_scalar("mem-allocated-count", mem_stats["allocation.all.current"], iteration)
         if args.log_max_attention_logit:
-            writer.add_scalar('max_attention_logit', max_attention_logit, iteration)
+            if writer:
+                writer.add_scalar('max_attention_logit', max_attention_logit, iteration)
             if wandb_writer:
                 wandb_writer.log({'max_attention_logit': max_attention_logit}, iteration)
 
@@ -2094,6 +2108,10 @@ def training_log(
             elapsed_time_per_iteration * 10**12 * args.world_size
         )
 
+        # MFU: actual TFLOP/s / theoretical peak TFLOP/s per GPU (A100 BF16 = 312)
+        peak_tflops_per_gpu = getattr(args, 'peak_tflops_per_gpu', 312.0)
+        mfu = throughput / peak_tflops_per_gpu
+
         one_logger_utils.track_e2e_metrics(args.log_throughput, throughput)
 
         # We log to stdout after the first iteration (controlled by `is_first_iteration`)
@@ -2115,12 +2133,21 @@ def training_log(
             elapsed_time_per_iteration * 1000.0
         )
         if args.log_throughput:
-            log_string += f' throughput per GPU (TFLOP/s/GPU): {throughput:.1f} |'
-            if args.log_timers_to_tensorboard:
-                if writer:
-                    writer.add_scalar('throughput', throughput, iteration)
-                if wandb_writer:
-                    wandb_writer.log({'throughput': throughput}, iteration)
+            tokens_per_sec = batch_size * args.seq_length / elapsed_time_per_iteration
+            tokens_per_sec_per_gpu = tokens_per_sec / args.world_size
+            log_string += f' throughput per GPU (TFLOP/s/GPU): {throughput:.1f} | MFU: {mfu:.3f} | tokens/s: {tokens_per_sec:.0f} | tokens/s/GPU: {tokens_per_sec_per_gpu:.0f} |'
+            if args.log_timers_to_tensorboard and writer:
+                writer.add_scalar('throughput', throughput, iteration)
+                writer.add_scalar('mfu', mfu, iteration)
+                writer.add_scalar('tokens-per-sec', tokens_per_sec, iteration)
+                writer.add_scalar('tokens-per-sec-per-gpu', tokens_per_sec_per_gpu, iteration)
+            if wandb_writer:
+                wandb_writer.log({
+                    'throughput': throughput,
+                    'mfu': mfu,
+                    'tokens-per-sec': tokens_per_sec,
+                    'tokens-per-sec-per-gpu': tokens_per_sec_per_gpu,
+                }, iteration)
         if args.log_energy:
             energy = (energy_monitor.lap() / total_iterations) / args.world_size
             power = energy / elapsed_time_per_iteration
@@ -2660,12 +2687,17 @@ def train(
             outer_weight_decay=args.diloco_outer_weight_decay,
             backup_device=args.diloco_backup_device,
             pin_memory=args.diloco_pin_memory,
+            use_bucketization=getattr(args, 'diloco_use_bucketization', False),
+            bucket_cap_mb=getattr(args, 'diloco_bucket_cap_mb', None),
+            should_quantize=getattr(args, 'diloco_should_quantize', False),
             lighthouse_addr=args.diloco_lighthouse_addr,
             replica_id=args.diloco_replica_id,
             min_replica_size=args.diloco_min_replica_size,
             torchft_timeout_sec=args.diloco_timeout_sec,
             torchft_quorum_timeout_sec=args.diloco_quorum_timeout_sec,
             use_nccl=args.diloco_use_nccl,
+            num_replicas=getattr(args, 'diloco_num_replicas', 1),
+            replica_index=getattr(args, 'diloco_replica_index', 0),
         )
         diloco_trainer = create_diloco_trainer(
             config=diloco_config,
@@ -3004,8 +3036,12 @@ def train(
             )
             iteration_sequences = batch_size
 
-        # Update consumed samples (always means sequences now)
-        args.consumed_train_samples += iteration_sequences
+        # Update consumed samples (always means sequences now).
+        # With DiLoCo virtual DP pool, advance by total_GBS = N_replicas * local_GBS
+        # so the sampler position stays consistent across replicas and on resume.
+        args.consumed_train_samples += (
+            iteration_sequences * getattr(args, 'diloco_num_replicas', 1)
+        )
 
         # Use iteration_sequences as batch_size for floating point operations
         batch_size = iteration_sequences
@@ -3499,7 +3535,10 @@ def build_train_valid_test_data_loaders(build_train_valid_test_datasets_provider
             args.train_samples is None
         ), 'Only backward compatiblity support for iteration-based training'
 
-        args.consumed_train_samples = args.iteration * args.global_batch_size
+        args.consumed_train_samples = (
+            args.iteration * args.global_batch_size
+            * getattr(args, 'diloco_num_replicas', 1)
+        )
     if args.iteration > 0 and args.consumed_valid_samples == 0:
         if args.train_samples is None:
             args.consumed_valid_samples = (
@@ -3509,7 +3548,10 @@ def build_train_valid_test_data_loaders(build_train_valid_test_datasets_provider
     # Get consumed train samples in this phase.
     if args.phase_transition_iterations:
         last_transition = max(iteration for iteration in (0, *args.phase_transition_iterations) if iteration <= args.iteration)
-        consumed_train_samples_in_current_phase = (args.iteration - last_transition) * args.global_batch_size
+        consumed_train_samples_in_current_phase = (
+            (args.iteration - last_transition) * args.global_batch_size
+            * getattr(args, 'diloco_num_replicas', 1)
+        )
     else:
         consumed_train_samples_in_current_phase = args.consumed_train_samples
 

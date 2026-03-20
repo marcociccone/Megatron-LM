@@ -65,6 +65,8 @@ class DiLoCoConfig:
         outer_nesterov: Whether to use Nesterov momentum.
         outer_weight_decay: Weight decay for the outer optimizer.
         backup_device: Device for parameter snapshots ('cpu' or 'cuda').
+            Use 'cuda' when GPU memory headroom is sufficient (e.g. with FSDP2).
+            Mirrors torchft train_diloco.py which uses backup_device=device.
         lighthouse_addr: Address of the torchft Lighthouse server.
         replica_id: Unique identifier for this replica group.
         min_replica_size: Minimum number of replicas for quorum.
@@ -72,7 +74,11 @@ class DiLoCoConfig:
         torchft_quorum_timeout_sec: Timeout for quorum in seconds.
         use_gloo: Use Gloo backend for cross-replica communication (recommended).
         use_nccl: Use NCCL backend for cross-replica communication.
-        pin_memory: Pin CPU memory for parameter snapshots.
+        pin_memory: Pin CPU memory for parameter snapshots (only used when backup_device='cpu').
+        use_bucketization: Coalesce pseudo-gradient allreduces into a single bucket.
+            Mirrors torchft DiLoCo use_bucketization option.
+        bucket_cap_mb: Bucket size in MB for bucketized allreduce (None = single bucket).
+        should_quantize: Quantize pseudo-gradients before allreduce (stub; not yet wired).
     """
 
     enabled: bool = False
@@ -81,7 +87,7 @@ class DiLoCoConfig:
     outer_momentum: float = 0.9
     outer_nesterov: bool = True
     outer_weight_decay: float = 0.0
-    backup_device: str = "cpu"
+    backup_device: str = "cuda"
     lighthouse_addr: str = ""
     replica_id: str = ""
     min_replica_size: int = 1
@@ -90,6 +96,11 @@ class DiLoCoConfig:
     use_gloo: bool = True
     use_nccl: bool = False
     pin_memory: bool = True
+    use_bucketization: bool = False
+    bucket_cap_mb: Optional[int] = None
+    should_quantize: bool = False
+    num_replicas: int = 1   # total DiLoCo replicas (for virtual DP pool)
+    replica_index: int = 0  # 0-based index of this replica
 
 
 def _get_all_parameters(model_chunks: List[nn.Module]) -> List[Tuple[str, nn.Parameter]]:
@@ -121,12 +132,18 @@ class DiLoCoOuterOptimizer:
         momentum: float = 0.9,
         nesterov: bool = True,
         weight_decay: float = 0.0,
-        backup_device: str = "cpu",
+        backup_device: str = "cuda",
         pin_memory: bool = True,
+        use_bucketization: bool = False,
+        bucket_cap_mb: Optional[int] = None,
+        should_quantize: bool = False,
     ):
         self._named_params = named_params
         self._backup_device = torch.device(backup_device)
         self._pin_memory = pin_memory and backup_device == "cpu"
+        self._use_bucketization = use_bucketization
+        self._bucket_cap_mb = bucket_cap_mb
+        self._should_quantize = should_quantize
 
         # Create the outer SGD optimizer over the model parameters.
         # We only call step() on it during the outer sync, setting .grad
@@ -144,11 +161,22 @@ class DiLoCoOuterOptimizer:
         self._snapshots: Dict[str, torch.Tensor] = {}
         self._save_snapshots()
 
+    @staticmethod
+    def _local(t: torch.Tensor) -> torch.Tensor:
+        """Return the local shard of a DTensor (FSDP2), or the tensor unchanged.
+
+        Mirrors torchft's extract_local_tensor(): allreduce and snapshot ops
+        must operate on plain tensors, not DTensors.
+        """
+        if hasattr(t, 'to_local'):
+            return t.to_local()
+        return t
+
     def _save_snapshots(self) -> None:
         """Save current parameters as snapshots for pseudo-gradient computation."""
         with torch.no_grad():
             for name, param in self._named_params:
-                t = param.data.detach().clone().to(self._backup_device)
+                t = self._local(param.data).detach().clone().to(self._backup_device)
                 if self._pin_memory and t.device == torch.device("cpu"):
                     t = t.pin_memory()
                 self._snapshots[name] = t
@@ -157,21 +185,22 @@ class DiLoCoOuterOptimizer:
         """Restore parameters from snapshots (before outer optimizer step)."""
         with torch.no_grad():
             for name, param in self._named_params:
-                param.data.copy_(
-                    self._snapshots[name].to(param.device), non_blocking=True
-                )
+                # _local() returns the local storage tensor of a DTensor —
+                # copying into it updates the underlying DTensor in-place.
+                local = self._local(param.data)
+                local.copy_(self._snapshots[name].to(local.device), non_blocking=True)
 
     def compute_pseudo_gradients(self) -> Dict[str, torch.Tensor]:
         """Compute pseudo-gradients: delta = theta_0 - theta_current.
 
-        Returns pseudo-gradients on the same device as the parameters
-        (typically GPU) for allreduce.
+        Mirrors torchft local_sgd.py:_save_grads(). Operates on local shards
+        so the result is a plain tensor suitable for manager.allreduce().
         """
         pseudo_grads = {}
         with torch.no_grad():
             for name, param in self._named_params:
-                snapshot = self._snapshots[name].to(param.device, non_blocking=True)
-                pseudo_grads[name] = snapshot - param.data
+                local_param = self._local(param.data)
+                pseudo_grads[name] = self._snapshots[name].to(local_param.device) - local_param
         return pseudo_grads
 
     def step(self, pseudo_grads: Dict[str, torch.Tensor]) -> None:
@@ -185,10 +214,25 @@ class DiLoCoOuterOptimizer:
         # Restore to theta_0
         self._restore_snapshots()
 
-        # Set gradients for the outer optimizer
+        # Set gradients for the outer optimizer.
+        # For DTensor params (FSDP2), wrap the local pseudo-grad back into a
+        # DTensor so SGD operates on the correct distributed structure.
+        # Mirrors torchft local_sgd.py:_set_grads().
         with torch.no_grad():
             for name, param in self._named_params:
-                param.grad = pseudo_grads[name].to(param.device)
+                grad = pseudo_grads[name]
+                if hasattr(param.data, 'to_local'):
+                    from torch.distributed.tensor import DTensor
+                    local = self._local(param.data)
+                    param.grad = DTensor.from_local(
+                        grad.to(local.device),
+                        param.device_mesh,
+                        param.placements,
+                        shape=param.shape,
+                        stride=param.stride(),
+                    )
+                else:
+                    param.grad = grad.to(param.device)
 
         # Step outer optimizer
         self._optimizer.step()
@@ -258,11 +302,26 @@ class DiLoCoTrainer:
             weight_decay=config.outer_weight_decay,
             backup_device=config.backup_device,
             pin_memory=config.pin_memory,
+            use_bucketization=config.use_bucketization,
+            bucket_cap_mb=config.bucket_cap_mb,
+            should_quantize=config.should_quantize,
         )
 
         # Cross-replica process group for pseudo-gradient allreduce.
         # In standalone mode (no torchft), this must be provided.
         self._cross_replica_pg = cross_replica_pg
+
+    def get_dp_info(self, dp_rank: int, dp_size: int) -> Tuple[int, int]:
+        """Virtual DP pool: expand DP rank/size across replicas.
+
+        Mirrors boomtitan's FTManager.get_dp_info.
+        Returns (effective_dp_size, effective_dp_rank).
+        """
+        n = self._config.num_replicas
+        i = self._config.replica_index
+        if n > 1:
+            return dp_size * n, dp_size * i + dp_rank
+        return dp_size, dp_rank
 
     def post_train_step(self, iteration: int) -> bool:
         """Called after each Megatron train_step.
@@ -373,16 +432,22 @@ class FaultTolerantDiLoCoTrainer:
             weight_decay=config.outer_weight_decay,
             backup_device=config.backup_device,
             pin_memory=config.pin_memory,
+            use_bucketization=config.use_bucketization,
+            bucket_cap_mb=config.bucket_cap_mb,
+            should_quantize=config.should_quantize,
         )
 
-        # Create torchft ProcessGroup
+        # Create torchft ProcessGroup and Manager.
+        # Proxy handling: HTTP_PROXY/HTTPS_PROXY are set in setup_env.sh for
+        # WandB/HF access. NO_PROXY=.leonardo.local and GRPC_PROXY_OVERRIDE=""
+        # ensure intra-cluster traffic (lighthouse gRPC, Gloo TCP, aiohttp
+        # checkpoint transfer) bypasses the proxy without needing to strip env vars.
         timeout = timedelta(seconds=config.torchft_timeout_sec)
         if config.use_nccl:
             self._ft_pg = ProcessGroupBabyNCCL(timeout=timeout)
         else:
             self._ft_pg = ProcessGroupGloo(timeout=timeout)
 
-        # Create torchft Manager
         self._manager = Manager(
             pg=self._ft_pg,
             load_state_dict=self._load_state_dict,
@@ -392,7 +457,10 @@ class FaultTolerantDiLoCoTrainer:
             timeout=timeout,
             quorum_timeout=timedelta(seconds=config.torchft_quorum_timeout_sec),
             replica_id=config.replica_id,
+            lighthouse_addr=config.lighthouse_addr,
         )
+        # finally:
+        #     os.environ.update(_saved_env)
 
         logger.info(
             f"FaultTolerantDiLoCoTrainer initialized: "
@@ -435,6 +503,18 @@ class FaultTolerantDiLoCoTrainer:
                 state_dict["opt_param_scheduler"]
             )
 
+    def get_dp_info(self, dp_rank: int, dp_size: int) -> Tuple[int, int]:
+        """Virtual DP pool: expand DP rank/size across replicas.
+
+        Mirrors boomtitan's FTManager.get_dp_info.
+        Returns (effective_dp_size, effective_dp_rank).
+        """
+        n = self._config.num_replicas
+        i = self._config.replica_index
+        if n > 1:
+            return dp_size * n, dp_size * i + dp_rank
+        return dp_size, dp_rank
+
     def post_train_step(self, iteration: int) -> bool:
         """Called after each Megatron train_step.
 
@@ -460,13 +540,29 @@ class FaultTolerantDiLoCoTrainer:
         # Compute pseudo-gradients
         pseudo_grads = self._outer_optimizer.compute_pseudo_gradients()
 
-        # Allreduce pseudo-gradients via torchft (fault-tolerant)
-        works = []
-        for name, grad in pseudo_grads.items():
-            work = self._manager.allreduce(grad)
-            works.append(work)
-        for work in works:
-            work.wait()
+        # Allreduce pseudo-gradients via torchft (fault-tolerant).
+        # Two modes mirroring torchft DiLoCo:
+        #   use_bucketization=True  → _allreduce_bucketized: single flat tensor allreduce
+        #   use_bucketization=False → _allreduce_per_param:  one allreduce per parameter
+        if self._outer_optimizer._use_bucketization:
+            names = list(pseudo_grads.keys())
+            grads = [pseudo_grads[n] for n in names]
+            numels = [g.numel() for g in grads]
+            shapes = [g.shape for g in grads]
+            flat = torch.cat([g.flatten() for g in grads])
+            self._manager.allreduce(flat).wait()
+            # Unpack averaged flat buffer back into pseudo_grads
+            offset = 0
+            for name, numel, shape in zip(names, numels, shapes):
+                pseudo_grads[name] = flat[offset:offset + numel].view(shape)
+                offset += numel
+        else:
+            works = []
+            for name, grad in pseudo_grads.items():
+                work = self._manager.allreduce(grad)
+                works.append(work)
+            for work in works:
+                work.wait()
 
         # Check if this step should be committed
         if self._manager.should_commit():
@@ -524,6 +620,15 @@ def create_diloco_trainer(
     if not config.enabled:
         return None
 
+    # Propagate virtual DP pool settings to config
+    try:
+        from megatron.training import get_args
+        args = get_args()
+        config.num_replicas = getattr(args, 'diloco_num_replicas', 1)
+        config.replica_index = getattr(args, 'diloco_replica_index', 0)
+    except Exception:
+        pass  # args not available (e.g., unit tests)
+
     if config.lighthouse_addr:
         # Fault-tolerant mode via torchft
         return FaultTolerantDiLoCoTrainer(
@@ -539,3 +644,22 @@ def create_diloco_trainer(
             model_chunks=model_chunks,
             cross_replica_pg=cross_replica_pg,
         )
+
+
+def get_diloco_dp_info(dp_rank: int, dp_size: int) -> Tuple[int, int]:
+    """Standalone version of DiLoCoTrainer.get_dp_info for use in data_samplers.py.
+
+    Mirrors boomtitan's ft_manager.get_dp_info pattern.
+    Returns (effective_dp_size, effective_dp_rank) for the virtual DP pool.
+    Falls back to (dp_size, dp_rank) when DiLoCo is disabled or args unavailable.
+    """
+    try:
+        from megatron.training import get_args
+        args = get_args()
+        n = getattr(args, 'diloco_num_replicas', 1)
+        i = getattr(args, 'diloco_replica_index', 0)
+    except Exception:
+        return dp_size, dp_rank
+    if n > 1:
+        return dp_size * n, dp_size * i + dp_rank
+    return dp_size, dp_rank

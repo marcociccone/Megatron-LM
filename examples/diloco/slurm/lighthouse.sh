@@ -32,7 +32,7 @@ echo "================================================"
 # Write hostname to a shared file so replica jobs can discover it automatically
 LIGHTHOUSE_ADDR_FILE="${BASE_CHECKPOINT_PATH}/lighthouse_addr.txt"
 mkdir -p "${BASE_CHECKPOINT_PATH}"
-echo "$(hostname):${LIGHTHOUSE_PORT}" > "${LIGHTHOUSE_ADDR_FILE}"
+echo "http://$(hostname):${LIGHTHOUSE_PORT}" > "${LIGHTHOUSE_ADDR_FILE}"
 echo "Address written to: ${LIGHTHOUSE_ADDR_FILE}"
 
 torchft_lighthouse \

@@ -2124,11 +2124,22 @@ def _add_diloco_args(parser):
                        help='Use Nesterov momentum in outer optimizer (default: True).')
     group.add_argument('--diloco-outer-weight-decay', type=float, default=0.0,
                        help='Weight decay for DiLoCo outer optimizer. Default: 0.0.')
-    group.add_argument('--diloco-backup-device', type=str, default='cpu',
+    group.add_argument('--diloco-backup-device', type=str, default='cuda',
                        choices=['cpu', 'cuda'],
-                       help='Device for parameter snapshots. Default: cpu.')
+                       help='Device for parameter snapshots. Default: cuda. '
+                       'Use cuda with FSDP2 (sharded params fit in GPU memory). '
+                       'Use cpu when full-model DDP saturates GPU memory.')
     group.add_argument('--diloco-pin-memory', action='store_true', default=True,
                        help='Pin CPU memory for parameter snapshots (default: True).')
+    group.add_argument('--diloco-use-bucketization', action='store_true',
+                       help='Coalesce all pseudo-gradient allreduces into a single '
+                       'flat buffer (mirrors torchft DiLoCo use_bucketization).')
+    group.add_argument('--diloco-bucket-cap-mb', type=int, default=None,
+                       help='Bucket size in MB for bucketized allreduce. '
+                       'None = all parameters in one bucket.')
+    group.add_argument('--diloco-should-quantize', action='store_true',
+                       help='Quantize pseudo-gradients before allreduce '
+                       '(mirrors torchft DiLoCo should_quantize). Currently a no-op stub.')
     # torchft / fault tolerance args
     group.add_argument('--diloco-lighthouse-addr', type=str, default='',
                        help='Address of torchft Lighthouse server (e.g. localhost:29510). '
@@ -2149,6 +2160,15 @@ def _add_diloco_args(parser):
     group.add_argument('--diloco-use-nccl', action='store_true',
                        help='Use NCCL for cross-replica communication instead of Gloo. '
                        'Requires GPU-to-GPU connectivity across replicas.')
+    group.add_argument('--diloco-num-replicas', type=int, default=1,
+                       help='Total number of DiLoCo replicas. Used by the data sampler '
+                       'to implement the virtual DP pool: all replicas share one document '
+                       'shuffle and each gets a non-overlapping slice of every batch, '
+                       'exactly as if they were a single run with N_replicas*local_dp ranks.')
+    group.add_argument('--diloco-replica-index', type=int, default=0,
+                       help='0-based integer index of this replica (0..diloco-num-replicas-1). '
+                       'Used with --diloco-num-replicas to compute the global DP rank offset '
+                       'for the data sampler.')
     return parser
 
 
